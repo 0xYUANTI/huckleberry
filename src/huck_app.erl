@@ -21,8 +21,8 @@ stop(_State)        -> ok.
 -include_lib("eunit/include/eunit.hrl").
 
 start_stop_test() ->
-  ok = application:start(huck),
-  ok = application:stop(huck).
+  ok = application:start(huckleberry),
+  ok = application:stop(huckleberry).
 
 -endif.
 

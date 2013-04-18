@@ -2,8 +2,8 @@
                            , {vsn,          git}
                            , {applications, [kernel, stdlib]}
                            , {env,          []}
-                           , {mod,          {gen_app_app, [[]]}}
-                           , {registered,   [gen_app_sup]}
+                           , {mod,          {huck_app, [[]]}}
+                           , {registered,   [huck_sup, huck_server]}
                            ]}.
 
 %%% eof
