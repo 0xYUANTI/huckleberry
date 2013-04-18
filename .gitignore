@@ -1,0 +1,7 @@
+deps/
+ebin/
+doc/
+.eunit/
+*.beam
+*.app
+*.plt

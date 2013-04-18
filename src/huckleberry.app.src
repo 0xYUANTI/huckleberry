@@ -1,0 +1,9 @@
+{application, huckleberry, [ {description,  "huckleberry"}
+                           , {vsn,          git}
+                           , {applications, [kernel, stdlib]}
+                           , {env,          []}
+                           , {mod,          {gen_app_app, [[]]}}
+                           , {registered,   [gen_app_sup]}
+                           ]}.
+
+%%% eof
