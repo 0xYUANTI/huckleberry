@@ -1,25 +1,19 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%% @doc Root supervisor.
+%%% @doc Behaviour for state machines.
 %%% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %%%_* Module declaration ===============================================
--module(huck_sup).
--behaviour(supervisor).
-
-%%%_* Exports ==========================================================
--export([ start_link/1
-        ]).
-
--export([ init/1
-        ]).
+-module(huck_statemachine).
 
 %%%_* Code =============================================================
-start_link(Args) -> supervisor:start_link({local, ?MODULE}, ?MODULE, Args).
+-type statem()  :: _.
+-type command() :: _.
+-type answer()  :: _.
 
-init(Args) ->
-  {ok, s2_strats:worker_supervisor_strat(
-         [s2_strats:permanent_worker_spec(huck_fsm, Args)])}.
+-callback new()                      -> statem().
+-callback apply(statem(), command()) -> statem().
+-callback query(statem(), command()) -> answer().
 
 %%%_* Emacs ============================================================
 %%% Local Variables:

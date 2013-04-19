@@ -3,7 +3,7 @@
                            , {applications, [kernel, stdlib]}
                            , {env,          []}
                            , {mod,          {huck_app, [[]]}}
-                           , {registered,   [huck_sup, huck_server]}
+                           , {registered,   [huck_sup, huck_fsm]}
                            ]}.
 
 %%% eof
