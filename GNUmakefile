@@ -2,7 +2,7 @@
 
 REBAR=./rebar
 PLT=./.plt
-suite=$(if $(SUITE), suite=$(SUITE), )
+suite=$(if $(SUITE), suites=$(SUITE), )
 
 # Basics ###############################################################
 .PHONY: all deps compile get-deps update-deps doc clean distclean
