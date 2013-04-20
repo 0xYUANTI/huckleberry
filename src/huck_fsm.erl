@@ -43,29 +43,28 @@
 %%%_ * Types -----------------------------------------------------------
 %%%_  * Server state ---------------------------------------------------
 -record(s,
-        { nodes :: [node()]
-        , timer :: reference()
+        { nodes=error('s.nodes')               :: [node()]
+        , timer=error('s.timer')               :: reference()
         , current_term=error('s.current_term') :: non_neg_integer()
-        , voted_for=error('s.voted_for')       :: replica()
-        , log=error('s.log')                   :: log()
+        , voted_for=error('s.voted_for')       :: node()
+        , log=error('s.log')                   :: _
         }).
 
 %%%_  * Messages -------------------------------------------------------
-%% Messages.
+-record(request_vote,
+        { term=error('request_vote.term')                       :: non_neg_integer()
+        , candidate_id=error('request_vote.candidate_id')       :: node()
+        , last_log_index=error('request_vote.last_log_index')   :: non_neg_integer()
+        , last_log_term=error('request_vote.last_log_term')     :: non_neg_integer()
+        }).
+
 -record(append_entries,
         { term=error('append_entries.term')                     :: non_neg_integer()
-        , leader_id=error('append_entries.leader_id')           :: replica_id()
+        , leader_id=error('append_entries.leader_id')           :: node()
         , prev_log_index=error('append_entries.prev_log_index') :: non_neg_integer()
         , prev_log_term=error('append_entries.prev_log_term')   :: non_neg_integer()
         , entries=error('append_entries.entries')               :: [_]
         , commit_index=error('append_entries.commit_index')     :: non_neg_integer()
-        }).
-
--record(request_vote,
-        { term=error('request_vote.term')                       :: non_neg_integer()
-        , candidate_id=error('request_vote.candidate_id')       :: replica_id()
-        , last_log_index=error('request_vote.last_log_index')   :: non_neg_integer()
-        , last_log_term=error('request_vote.last_log_term')     :: non_neg_integer()
         }).
 
 %%%_ * API -------------------------------------------------------------
@@ -92,110 +91,111 @@ handle_info(Info, State, S) -> ?warning("~p", [Info]), {next_state, State, S}.
 
 %%%_ * gen_fsm callbacks: states ---------------------------------------
 %%%_  * Follower -------------------------------------------------------
+follower({update, _} = Msg, _From, S) ->
+  forward(Msg, S),
+  {next_state, follower, S};
+follower({inspect, } = Msg, _From, S) ->
+  forward(Msg, S),
+  {next_state, follower, S};
+follower(#request_vote{term=T, candidate_id=CI} = RV,
+         _From,
+         #s{timer=Ref, current_term=CT} = S0) ->
+  case handle_request_vote(RV, S0) of
+    {ok, _} = Ok ->
+      S = S0#s{current_term=T, voted_for=CI, timer=reset_timer(Ref, election)},
+      {reply, Ok,  follower, S};
+    {error, _} = Err ->
+      S = S0#s{current_term=max(T, CT)},
+      {reply, Err, follower, S}
+  end;
 follower(#append_entries{} = Msg, _From, S0) ->
-  {Ret, S} = handle_append_entries(follower, Msg, S0),
-  {reply, Ret, follower, S};
-follower(#request_vote{} = Msg, _From, S0) ->
-  {Ret, S} = handle_request_vote(follower, Msg, S0),
+  %%...
   {reply, Ret, follower, S};
 follower({timeout, Ref, election}, _From, #s{timer=Ref} = S) ->
   {next_state, candidate, start_election(S)}.
 
 %%%_  * Candidate ------------------------------------------------------
-candidate(#append_entries{} = Msg, _From, S0) ->
-  {Ret, State, S} = handle_append_entries(candidate, Msg, S0),
+candidate({update, _}, _From, S) ->
+  {next_state, {error, election}, candidate, S};
+candidate({inspect, _}, _From, S) ->
+  {reply, {error, election}, candidate, S};
+candidate(#request_vote{term=T, candidate_id=CI} = RV,
+         _From,
+         #s{timer=Ref, current_term=CT} = S0) ->
+  case handle_request_vote(RV, S0) of
+    {ok, _} = Ok ->
+      S = S0#s{current_term=T, voted_for=CI, timer=reset_timer(Ref, election)},
+      {reply, Ok,  follower, S};
+    {error, _} = Err ->
+      case T > CT of
+        true  -> {reply, Err, follower,  S0#s{current_term=T}};
+        false -> {reply, Err, candidate, S0}
+      end
+  end;
+candidate(#vote{}, _From, S0) ->
+  %%...
   {reply, Ret, State, S};
-candidate(#request_vote{} = Msg, _From, S0) ->
-  {Ret, State, S} = handle_request_vote(candidate, Msg, S0),
-  {reply, Ret, State, S};
-candidate(#vote{} = Msg, _From, S0) ->
-  {Ret, State, S} = count_vote(Msg, S0),
+candidate(#append_entries{}, _From, S0) ->
+  %%...
   {reply, Ret, State, S};
 candidate({timeout, Ref, election}, _From, #s{timer=Ref} = S) ->
   {next_state, candidate, start_election(S)}.
 
 %%%_  * Leader ---------------------------------------------------------
-leader(#append_entries{} = Msg, _From, S0) ->
-  {Ret, State, S} = handle_append_entries(leader, Msg, S0),
-  {reply, Ret, State, S};
-leader(#request_vote{} = Msg, _From, S0) ->
-  {Ret, State, S} = handle_request_vote(leader, Msg, S0),
-  {reply, Ret, State, S};
-leader({inspect, Cmd}, _From, S) ->
-  {reply, do_inspect(Cmd, S), leader, S};
 leader({update, Cmd}, _From, S) ->
-  {reply, do_update(Cmd, S), leader, S};
+  %%...
+  {reply, Ret, leader, S};
+leader({inspect, Cmd}, _From, S) ->
+  %%...
+  {reply, Ret, leader, S};
+leader(#request_vote{} = Msg, _From, S0) ->
+  %%...
+  {reply, Ret, State, S};
+candidate(#vote{}, _From, S0) ->
+  %%...
+  {reply, Ret, State, S};
+leader(#append_entries{} = Msg, _From, S0) ->
+  %%...
+  {reply, Ret, State, S};
 leader({timeout, Ref, heartbeat}, _From, , #s{timer=Ref} = S) ->
   {next_state, leader, do_heartbeat(S)}.
 
 %%%_ * Internals -------------------------------------------------------
-%%%_  * Initialization -------------------------------------------------
+%%%_  * request_vote ---------------------------------------------------
+handle_request_vote(#request_vote{term=T, candidate_id=CI, last_log_vsn=LLV},
+                    #s{current_term=CT, voted_for=VF, log_vsn=LV}) ->
+  s2_maybe:do(
+    [ ?thunk(T >= CT                    orelse throw({error, {current, CT}}))
+    , ?thunk(CI =:= VF orelse VF =:= '' orelse throw({error, {voted, VF}}))
+    , ?thunk(LLV >= LV                  orelse throw({error, {log, LV}}))
+    , ?thunk(node())
+    ]).
+
+
+
+broadcast(Msg, Nodes) ->
+  Self = self(),
+  Pid  = spawn_link(?thunk(do_broadcast(Msg, Nodes))),
+  receive
+    {quorum, Result} ->
+    {'EXIT', _, _} ->
+  end.
+
+  s2_par:eval(fun(Node) -> send(Node, Msg) end, Nodes
+
+
+
+
+
+
+
+
+
 do_init(Args) ->
   #s{ nodes = s2_env:get_arg(Args, ?APP, nodes)
     , timer = reset_election_timeout()
     }.
 
-%%%_  * request_vote ---------------------------------------------------
-handle_request_vote(follower,
-                    #request_vote{ term           = Term
-                                 , candidate_id   = Candidate
-                                 , last_log_index = LLI
-                                 , last_log_term  = LLT
-                                 },
-                    #s{}) ->
-  ok;
-handle_request_vote(candidate,
-                    #request_vote{ term           = Term
-                                 , candidate_id   = Candidate
-                                 , last_log_index = LLI
-                                 , last_log_term  = LLT
-                                 },
-                    #s{}) ->
-  reset_election_timeout(), %iff GRANT vote
-  ok;
-handle_request_vote(leader,
-                    #request_vote{ term           = Term
-                                 , candidate_id   = Candidate
-                                 , last_log_index = LLI
-                                 , last_log_term  = LLT
-                                 },
-                    #s{}) ->
-  ok.
-
-%%%_  * append_entries -------------------------------------------------
-handle_append_entries(follower,
-                      #append_entries{ term           = Term
-                                     , leader_id      = Leader
-                                     , prev_log_index = PLI
-                                     , prev_log_term  = PLT
-                                     , entries        = Entries
-                                     , commit_index   = CI
-                                     },
-                     #s{}) ->
-  reset_election_timeout(),
-  ok;
-handle_append_entries(candidate,
-                      #append_entries{ term           = Term
-                                     , leader_id      = Leader
-                                     , prev_log_index = PLI
-                                     , prev_log_term  = PLT
-                                     , entries        = Entries
-                                     , commit_index   = CI
-                                     },
-                     #s{}) ->
-  ok;
-handle_append_entries(leader,
-                      #append_entries{ term           = Term
-                                     , leader_id      = Leader
-                                     , prev_log_index = PLI
-                                     , prev_log_term  = PLT
-                                     , entries        = Entries
-                                     , commit_index   = CI
-                                     },
-                     #s{}) ->
-  ok.
-
-%%%_  * Elections ------------------------------------------------------
 start_election() ->
   increment_current_term(),
   vote_for_self(),
@@ -205,7 +205,6 @@ start_election() ->
 count_vote() ->
   ok.
 
-%%%_  * Timeouts -------------------------------------------------------
 reset_timer('', Msg) ->
   gen_fsm:start_timer(timeout(Msg), Msg);
 reset_timer(Msg, Ref) ->
@@ -216,13 +215,6 @@ reset_timer(Msg, Ref) ->
 
 timeout(election)  -> s2_rand:number(, );
 timeout(heartbeat) -> s2_rand:number(, ).
-
-%%%_  * Commands -------------------------------------------------------
-do_inspect() ->
-  ok.
-
-do_update() ->
-  ok.
 
 %%%_* Tests ============================================================
 -ifdef(TEST).
