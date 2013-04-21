@@ -7,13 +7,16 @@
 -module(huck_statemachine).
 
 %%%_* Code =============================================================
--type statem()  :: _.
--type command() :: _.
--type answer()  :: _.
+-type statem()   :: _.
+-type snapshot() :: _.
+-type command()  :: _.
+-type answer()   :: _.
 
--callback new()                      -> statem().
--callback apply(statem(), command()) -> statem().
--callback query(statem(), command()) -> answer().
+-callback new()                        -> statem().
+-callback new(snapshot())              -> statem().
+-callback update(statem(), command())  -> statem().
+-callback inspect(statem(), command()) -> answer().
+-callback snapshot(statem())           -> snapshot().
 
 %%%_* Emacs ============================================================
 %%% Local Variables:
