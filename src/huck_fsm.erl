@@ -1,5 +1,34 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% @doc A single Raft replica.
+%%%
+%%% @todo commit
+%%% @todo catchup
+%%% @todo reconfiguration
+%%%
+%%% Misc notes
+%%% ==========
+%%% Alternative messaging model (I think this is closer to the raft paper):
+%%% single synchronous RPC operation that sends #append{}/#vote{} in
+%%% parallel, then waits for replies before returning.
+%%% need to incorporate state-changes into ack-processing (I'm not sure
+%%% that the current approach of interleaving acks and stepping down
+%%% when receiving rpcs is correct anyway).
+%%% guess this would be done with plain !-messages plus a monitor.
+%%% This gets rid of request IDs, and makes it way easier to commit log
+%%% entries in the leader.
+%%%
+%%% I think something like:
+%%% rpc(msg(), #s{}) -> {result(), #s{}}.
+%%% where result() is used to determine which FSM-state to transition to
+%%% should be capable of abstracting the shared parts while keeping the overall
+%%% FSM logic readably in the StateName/2 callbacks.
+%%%
+%%% The #append{} broadcasting code should be structured differently, so
+%%% that the catch-up protocol falls out cleanly.
+%%%
+%%% Don't understand why the raft paper insists on retrying failed rpcs...
+%%% seems easier to just treat timeouts as failure, retry via catch-up
+%%%
 %%% @todo assertions
 %%% @todo logging
 %%% @todo metrics
