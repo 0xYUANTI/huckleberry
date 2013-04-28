@@ -14,6 +14,8 @@
 -define(APP, huckleberry).
 
 %%%_* Types ============================================================
+-type id()  :: non_neg_integer().
+-type vsn() :: {Term::non_neg_integer(), Index::non_neg_integer()}.
 
 %%%_* Footer ===========================================================
 -endif. %include guard

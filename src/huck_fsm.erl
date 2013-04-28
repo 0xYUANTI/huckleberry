@@ -51,34 +51,39 @@
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
 %%%_  * Server state ---------------------------------------------------
--type id()  :: non_neg_integer().
--type vsn() :: {Term::non_neg_integer(), Index::non_neg_integer()}.
-
 -record(s,
-        { %% Cluster
-          nodes=error('s.nodes')         :: [node()]
-        , term=error('s.term')           :: non_neg_integer()
-        , leader=error('s.leader')       :: node()
+        { %% Cluster members
+          nodes=error('s.nodes') :: [node()]
+          %% Clock
+        , term=error('s.term') :: non_neg_integer()
+          %% Last known leader
+        , leader=error('s.leader') :: node()
+          %% Voted for in current election
         , candidate=error('s.candidate') :: node()
-          %% Log
-        , log_vsn=error('s.log_vsn')     :: vsn()
-        , log=error('s.log')             :: _
+          %% Log state
+        , log_vsn=error('s.log_vsn') :: vsn()
+          %% huck_log handle
+        , log=error('s.log') :: _
+          %% Statemachine state
         , committed=error('s.committed') :: non_neg_integer()
-          %% Internal
-        , timer=error('s.timer')         :: reference()
-        , reqs=error('s.reqs')           :: dict(id(), [#vote{}] | [#ack{}])
+          %% Current timeout
+        , timer=error('s.timer') :: reference()
+          %% In-flight RPCs
+        , reqs=dict:new() :: dict(id(), [#ack{}])
+          %% Clients
+        , froms=dict:new() :: dict(id(), {_, _})
         }).
 
 %%%_  * Messages -------------------------------------------------------
 -record(vote,
-        { id=s2_rand:int()                    :: id()
+        { id=?uuid()                          :: uuid()
         , term=error('vote.term')             :: non_neg_integer()
         , leader=node()                       :: node()
         , log_vsn=error('vote.log_vsn')       :: vsn().
         }).
 
 -record(append,
-        { id=s2_rand:int()                    :: id()
+        { id=?uuid()                          :: uuid()
         , term=error('append.term')           :: non_neg_integer()
         , candidate=node()                    :: node()
         , log_vsn=error('append.log_vsn')     :: vsn()
@@ -87,7 +92,7 @@
         }).
 
 -record(ack
-        { id=error('ack.id')                  :: id()
+        { id=error('ack.id')                  :: uuid()
         , term=error('ack.term')              :: non_neg_integer()
         , node=node()                         :: node()
         , success=error('ack.success')        :: boolean()
@@ -97,8 +102,8 @@
 start_link(Args) -> gen_fsm:start_link({local, ?FSM}, ?MODULE, Args, []).
 stop()           -> gen_fsm:sync_send_all_state_event(?FSM, stop).
 
-update(Cmd)      -> gen_fsm:sync_send_event(?FSM, {update, Cmd}).
-inspect(Cmd)     -> gen_fsm:sync_send_event(?FSM, {inspect, Cmd}).
+update(Cmd)      -> gen_fsm:sync_send_event(?FSM, {update, Cmd}, infinity).
+inspect(Cmd)     -> gen_fsm:sync_send_event(?FSM, {inspect, Cmd}, infinity).
 
 %%%_ * gen_fsm callbacks: misc -----------------------------------------
 init(Args) -> {ok, follower, do_init(Args)}.
@@ -124,9 +129,9 @@ follower(#append{} = Append, #s{timer=T} = S0) ->
   _        = send(Append#append.leader, Ack),
   {next_state, follower, S#s{timer=reset(T, election)}};
 follower(#ack{}, S) ->
-  {next_state, follower, S};
+  {next_state, follower, S}; %ignore
 follower({timeout, T, election}, #s{timer=T} = S) ->
-  {next_state, candidate, start_election(S)}.
+  {next_state, candidate, do_election(S)}.
 
 
 follower(Msg, From, S) ->
@@ -156,9 +161,12 @@ candidate(#append{leader=L} = Append, #s{timer=T} = S0) ->
   end;
 candidate(#ack{} = Ack, #s{} = S0) ->
   {State, S} = ack(candidate, Ack, S0),
-  {next_state, State, S};
+  case State of
+    leader -> {next_state, State, do_heartbeat(S)};
+    _      -> {next_state, State, S}
+  end;
 candidate({timeout, T, election}, #s{timer=T} = S) ->
-  {next_state, candidate, start_election(S)}.
+  {next_state, candidate, do_election(S)}.
 
 
 candidate(_Msg, _From, S) ->
@@ -185,57 +193,60 @@ leader(#append{} = Append, #s{timer=T} = S0) ->
     false ->
       {next_state, leader, S}
   end;
-leader(#ack{} = Ack, #s{} = S0) ->
-  {State, S} = ack(leader, Ack, S0),
-  {next_state, State, S};
-leader({timeout, T, heartbeat},
-       #s{nodes=N, term=Te, log_vsn=L, committed=C, timer=T, reqs=R} = S) ->
-  { next_state
-  , candidate
-  , S#s{ timer = reset(T, heartbeat)
-       , reqs  = store(R, broadcast(N, #append{ term      = Te
-                                              , log_vsn   = L
-                                              , committed = C
-                                              }))
-       }
-  }.
+leader(#ack{id=I} = Ack, #s{froms=F} = S0) ->
+  case ack(leader, Ack, S0) of
+    {ok, S} ->
+      gen_fsm:reply(dict:fetch(I, F), ok),
+      commit(), %FIXME
+      {next_state, leader, S};
+    {{error, _} = Err, S} ->
+      gen_fsm:reply(dict:fetch(I, F), Err),
+      {next_state, leader, S};
+    S ->
+      {next_state, leader, S}
+  end;
+leader({timeout, T, heartbeat}, #s{timer=T} = S) ->
+  {next_state, candidate, do_heartbeat(S)}.
 
-%% FIXME: need to keep track of From
+
 leader({update, Cmd},
        From,
-       #s{nodes=N, term=T, log_vsn=L, committed=C, reqs=R} = S) ->
-  {next_state, leader, S#{reqs=store(R, broadcast(N, #append{ term      = T
-                                                            , log_vsn   = L
-                                                            , committed = C
-                                                            , entries   = [Cmd]
-                                                            }))};
+       #s{nodes=N, term=T, log=L, committed=C, reqs=R} = S) ->
+  E  = [Cmd],
+  LV = huck_log:log(L, E)
+  ID = broadcast(N, #append{term=T, log_vsn=LV, committed=C, entries=E}),
+  {next_state, leader, S#{ log_vsn = LV
+                         , reqs    = dict:store(ID, [], R)
+                         , froms   = dict:store(ID, From, F)
+                         }};
 leader({inspect, Cmd}, _From, {log=L} = S) ->
   {reply, ?lift(huck_log:inspect(L, Cmd)), leader, S}.
 
 %%%_ * Internals -------------------------------------------------------
 %%%_  * Bootstrap ------------------------------------------------------
 do_init(Args) ->
-  Dir = s2_env:get_arg(Args, ?APP, dir)
+  Root = s2_env:get_arg(Args, ?APP, root)
   #s{ nodes     = s2_env:get_arg(Args, ?APP, nodes)
-    , term      = s2_fs:read_file(filename:join(Dir, "term.term")
-    , leader    = s2_fs:read_file(filename:join(Dir, "leader.term")
-    , candidate = s2_fs:read_file(filename:join(Dir, "candidate.term")
-    , log       = huck_log:open(Dir)
+    , term      = s2_fs:read_file(filename:join(Root, "term.term")
+    , leader    = s2_fs:read_file(filename:join(Root, "leader.term")
+    , candidate = s2_fs:read_file(filename:join(Root, "candidate.term")
+    , log       = huck_log:open(Root)
     , timer     = gen_fsm:start_timer(timeout(election), election)
     }.
 
-timeout(election)  -> s2_rand:number(, );
+timeout(election)  -> s2_rand:number(150, 300); %ms
 timeout(heartbeat) -> s2_rand:number(, ).
 
 %%%_  * RPCs -----------------------------------------------------------
+%%%_   * Vote ----------------------------------------------------------
+-spec vote(#vote{}, #s{}) -> {#ack{}, #s{}}.
+%% @doc Pure function which implements Raft's election semantics.
 vote(#vote{id=I, term=T1, candidate=C1, log_vsn=LV1},
-         #s{term=T2, candidateC2, log_vsn=LV2}) ->
+     #s{term=T2, candidate=C2, log_vsn=LV2}) ->
   case
-    s2_maybe:do(
-      [ ?thunk(T1 >= T2                   orelse throw({error, {term, T2}}))
-      , ?thunk(C1 =:= C2 orelse C2 =:= '' orelse throw({error, {candidate, C2}}))
-      , ?thunk(LV1 >= LV2                 orelse throw({error, {log_vsn, LV2}}))
-      ])
+    ?do(?thunk(T1 >= T2                   orelse throw({error, {term, T2}})),
+        ?thunk(C1 =:= C2 orelse C2 =:= '' orelse throw({error, {candidate, C2}})),
+        ?thunk(LV1 >= LV2                 orelse throw({error, {log_vsn, LV2}})))
   of
     {ok, _} ->
       {#ack{id=I, term=T1, success=true}, S#s{term=max(T1, T2), candidate=C1}};
@@ -243,51 +254,83 @@ vote(#vote{id=I, term=T1, candidate=C1, log_vsn=LV1},
       {#ack{id=I, term=max(T1, T2), success=false}, S#s{term=max(T1, T2)}}
   end.
 
+%%%_   * Append --------------------------------------------------------
+-spec append(#append{}, #s{}) -> {#ack{}, #s{}}.
+%% @doc Pure function which implements Raft's replication semantics.
 append(#append{id=I, term=T1, leader=L, log_vsn=LV, entries=E, committed=C},
        #s{term=T2, log=Log} = S) ->
   case
-    s2_maybe:do(
-      [ ?thunk(T1 >= T2 orelse throw({error, {term, T2}}))
-      , ?thunk(huck_log:truncate(Log, LV))
-      , ?thunk(huck_log:append(Log, E))
-      , ?thunk(huck_log:commit(Log, C))
-      ])
+    ?do(?thunk(T1 >= T2 orelse throw({error, {term, T2}})),
+        ?thunk(huck_log:log(Log, LV, E, C)),
   of
     {ok, _} ->
-      {#ack{id=I, term=T1, success=true}, S#s{term=max(T1, T2), leader=L}};
+      {#ack{id=I, term=T1, success=true}, S#s{term=T1, leader=L}};
     {error, _} ->
       {#ack{id=I, term=max(T1, T2), success=false}, S#s{term=max(T1, T2)}}
   end.
 
-
-ack(State, #ack{id=I} = Ack, #s{reqs=R} = S) ->
-  case ?lift(dict:update(Id, s2_lists:cons(Ack), R)) of
-    {ok, _}    -> ack(State, S);
-    {error, _} -> {State, S} %ignore
+%%%_   * Ack -----------------------------------------------------------
+-spec ack(atom(), #ack{}, #s{}) -> {atom(), #s{}}.
+%% @doc Pure function which implements Raft's request FSM.
+ack(State, #ack{id=I} = Ack, #s{reqs=R0} = S) ->
+  case ?lift(dict:update(I, s2_lists:cons(Ack), R0)) of
+    %% We have an outstanding request with a matching UUID, check for quorum.
+    {ok, R} -> ack(State, I, S#s{reqs=R});
+    %% Ack concerns stale request, ignore.
+    {error, _} -> {State, S}
+  end;
+ack(candidate, ID, #s{} = S) ->
+  ?hence(dict:size(R) =:= 1),
+  case reqstate(ID, S) of
+    success -> {leader,    S#s{reqs=dict:new()}};
+    failure -> {candidate, S#s{reqs=dict:new()}};
+    tie     -> {candidate, S#s{reqs=dict:new()}};
+    pending -> {candidate, S}
+  end;
+ack(leader, ID, #s{reqs=R}) ->
+  case reqstate(ID, S) of
+    success -> {ok,              S#s{reqs=dict:erase(ID, R)}};
+    failure -> {{error, quorum}, S#s{reqs=dict:new(ID, R)}};
+    tie     -> {{error, quorum}, S#s{reqs=dict:new(ID, R)}};
+    pending -> S
   end.
 
-%% iff quorum -> become leader/gen_fsm:reply to From
-ack(candidate, #s{}) ->
-  ok;
-ack(leader, #s{}) ->
-  ok.
+
+reqstate(ID, #s{nodes=N, reqs=R}) ->
+  Cluster = length(N),
+  Quorum  = Cluster div 2, %self gives majority
+  Acks    = dict:fetch(ID, R),
+  Yays    = length([Ack || #ack{success=true}  <- Acks]),
+  Nays    = length([Ack || #ack{success=false} <- Acks]),
+  case {Yays >= Quorum, Nays >= Quorum, Yays + Nays =:= Cluster - 1} of
+    {true,  false, _}    -> success;
+    {false, true,  _}    -> failure;
+    {false, false, true} -> tie;
+    _                    -> pending
+  end.
+
+%%%_  * Transitions ----------------------------------------------------
+do_election(#s{nodes=N, term=T, log_vsn=L, timer=Ti} = S) ->
+  S#s{ term  = T+1
+     , timer = reset(Ti, election)
+     , reqs  = dict:store(broadcast(C, #vote{term=T+1, log_vsn=L}),
+                          [],
+                          dict:new())
+     }.
+
+do_heartbeat(#s{nodes=N, term=T, log_vsn=L, committed=C, timer=Ti, reqs=R} = S) ->
+  S#s{ timer = reset(Ti, heartbeat)
+     , reqs  = dict:store(broadcast(N, #append{term=T, log_vsn=L, committed=C}),
+                          [],
+                          R)
+     }.
 
 %%%_  * Primitives -----------------------------------------------------
-start_election(#s{nodes=N, term=T, log_vsn=L, timer=Ti} = S) ->
-  #s{ term  = T+1
-    , timer = reset(Ti, election)
-    , reqs  = store(dict:new(), broadcast(C, #vote{term=T+1, log_vsn=L}))
-    }.
-
-
 reset(Ref, Msg) ->
   Remaining = gen_fsm:cancel_timer(Ref),
   ?hence(is_integer(Remaining)),
   %% Don't need to flush.
   gen_fsm:start_timer(timeout(Msg), Msg).
-
-
-store(Dict, Id) -> dict:store(Id, [], Dict).
 
 
 broadcast(Nodes, MSg) ->
