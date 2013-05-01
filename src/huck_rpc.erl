@@ -44,26 +44,52 @@
 %%%_* Code =============================================================
 %%%_ * Election --------------------------------------------------------
 -spec election(#s{}) -> #s{}.
-election(S) -> S#s{candidate=node(), rpc=spawn_link(?MODULE, do_election, [S])}.
+election(S) ->
+  S#s{candidate=node(), rpc=spawn_link(?MODULE, do_election, [self(), S])}.
 
-do_election(#s{term=N, nodes=Nodes} = S) ->
+do_election(Parent, #s{term=N, nodes=Nodes} = S) ->
   broadcast(Nodes, {rpc_call, self(), #vote{term=N, log_vsn=V}}),
-  election_loop(S).
+  Ret = election_loop([], Term, length(Nodes)),
+  Parent ! {rpc_result, self(), Ret}.
 
-election_loop(#s{nodes=Nodes} = S) ->
+election_loop(Acc0, Term, ClusterSize) ->
   receive
-    #ack{} ->
+    #ack{} = A ->
+      case result([A|Acc0] = Acc, Term, ClusterSize) of
+        {error, pending} -> election_loop(Acc, Term, ClusterSize);
+        Ret              -> Ret
+      end
   after
     10 -> {error, timeout}
   end.
 
+result(Acks, Term, ClusterSize) ->
+  MaxTerm = lists:max([Ack#ack.term || Ack <- Acks]),
+  Quorum  = ClusterSize div 2, %self gives majority
+  Yays    = length([Ack || #ack{success=true}  <- Acks]),
+  Nays    = length([Ack || #ack{success=false} <- Acks]),
+  case
+    {MaxTerm > Term, Yays >= Quorum, Nays >= Quorum, Yays + Nays =:= Cluster-1}
+  of
+    {true,  false, _,     _}     -> {error, out_of_date}
+    {false, true,  false, _}     -> {ok, quorum};
+    {false, false, true,  _}     -> {error, reject};
+    {false, false, false, true}  -> {error, tie};
+    {false, false, false, false} -> {error, pending}
+  end.
+
+
+
+
 %%%_ * Heartbeat -------------------------------------------------------
--spec heartbeat(#s{}) -> pid().
+-spec heartbeat(#s{}) -> #s{}.
+heartbeat(S) -> replicate([], S).
 
 
 %%%_ * Replicate -------------------------------------------------------
--spec replicate(#s{}) -> pid().
-
+-spec replicate([_], #s{}) -> #s{}.
+replicate(Entries, S) ->
+  ok.
 
 %% one more case: catchup: -> send new append with more entries
 
