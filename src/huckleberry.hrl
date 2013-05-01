@@ -55,7 +55,9 @@
 -type msg()    :: {rpc_call,   pid(), #vote{} | #append{}}
                 | {rpc_return, pid(), return()}.
 
--type return() :: maybe(#s{}, #s{}).
+-type return() :: {success, #s{}}
+                | {failure, #s{}}
+                | {expired, #s{}}.
 
 %%%_* Footer ===========================================================
 -endif. %include guard

@@ -117,21 +117,15 @@ follower(Msg, From, S) ->
 %%%_  * Candidate ------------------------------------------------------
 candidate({rpc_call, Pid, Msg}, #s{} = S0) ->
   case huck_rpc:respond(Pid, Msg, S0) of
-    {ok, S} ->
-      {next_state, follower, reset(S)};
-    {error, S} when S#s.term > S0#s.term ->
-      {next_state, follower, reset(S)};
-    {error, S} when S#s.term =:= S0#s.term ->
-      {next_state, candidate, S}
+    {success, S} -> {next_state, follower, reset(S)};
+    {expired, S} -> {next_state, follower, reset(S)};
+    {failure, S} -> {next_state, candidate, S}
   end;
 candidate({rpc_return, Pid, Ret}, #s{rpc=Pid} = S0) ->
   case Ret of
-    {ok, S} ->
-      {next_state, leader, huck_rpc:heartbeat(S)};
-    {error, S} when S#s.term > S0#s.term ->
-      {next_state, follower, reset(S)};
-    {error, S} when S#s.term =:= S0#s.term ->
-      {next_state, candidate, S}
+    {success, S} -> {next_state, leader, huck_rpc:heartbeat(S)};
+    {expired, S} -> {next_state, follower, reset(S)};
+    {failure, S} -> {next_state, candidate, S}
   end;
 candidate({rpc_return, _, {error, _}}, #s{} = S) ->
   {next_state, candidate, S};
@@ -144,21 +138,18 @@ candidate(_Msg, _From, S) ->
 %%%_  * Leader ---------------------------------------------------------
 leader({rpc_call, Pid, Msg}, #s{} = S0) ->
   case huck_rpc:respond(Pid, Msg, S0) of
-    {ok, S} ->
-      {next_state, follower, reset(S)};
-    {error, S} when S#s.term > S0#s.term ->
-      {next_state, follower, reset(S)};
-    {error, S} when S#s.term =:= S0#s.term ->
-      {next_state, leader, S}
+    {success, S} -> {next_state, follower, reset(S)};
+    {expired, S} -> {next_state, follower, reset(S)};
+    {failure, S} -> {next_state, leader, S}
   end;
 leader({rpc_return, Pid, Ret} #s{rpc=Pid} = S0) ->
   case Ret of
-    {ok, S} ->
+    {success, S} ->
       %% ...
       {next_state, leader, S};
-    {error, S} when S#s.term > S0#s.term ->
+    {expired, S} ->
       {next_state, follower, reset(S)};
-    {error, S} when S#s.term =:= S0#s.term ->
+    {failure, S} ->
       %% ...
       {next_state, leader, S}
   end;

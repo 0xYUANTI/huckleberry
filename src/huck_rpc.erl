@@ -45,22 +45,18 @@
 %%%_ * Election --------------------------------------------------------
 -spec election(#s{}) -> #s{}.
 election(S) ->
-  S#s{candidate=node(), rpc=spawn_link(?MODULE, do_election, [self(), S])}.
-
-do_election(Parent, #s{term=N, nodes=Nodes} = S) ->
-  broadcast(Nodes, {rpc_call, self(), #vote{term=N, log_vsn=V}}),
-  Ret = election_loop([], Term, length(Nodes)),
-  Parent ! {rpc_result, self(), Ret}.
+  S#s{candidate=node(), rpc=rpc(#vote{term=N, log_vsn=V}, election_loop, S)}.
+  spawn_link(?MODULE, do_election, [self(), S])}.
 
 election_loop(Acc0, Term, ClusterSize) ->
   receive
     #ack{} = A ->
       case result([A|Acc0] = Acc, Term, ClusterSize) of
-        {error, pending} -> election_loop(Acc, Term, ClusterSize);
-        Ret              -> Ret
+        pending -> election_loop(Acc, Term, ClusterSize);
+        Ret     -> Ret
       end
   after
-    10 -> {error, timeout}
+    10 -> failure
   end.
 
 result(Acks, Term, ClusterSize) ->
@@ -71,14 +67,20 @@ result(Acks, Term, ClusterSize) ->
   case
     {MaxTerm > Term, Yays >= Quorum, Nays >= Quorum, Yays + Nays =:= Cluster-1}
   of
-    {true,  false, _,     _}     -> {error, out_of_date}
-    {false, true,  false, _}     -> {ok, quorum};
-    {false, false, true,  _}     -> {error, reject};
-    {false, false, false, true}  -> {error, tie};
-    {false, false, false, false} -> {error, pending}
+    {true,  false, _,     _}     -> expired;
+    {false, true,  false, _}     -> success;
+    {false, false, true,  _}     -> failure;
+    {false, false, false, true}  -> failure;
+    {false, false, false, false} -> pending
   end.
 
 
+
+rpc(Msg, Loop, S) ->
+  spawn_link(?MODULE, rpc, [Msg, Loop, S, self()]).
+rpc(Msg, Loop, S, Parent) ->
+  broadcast(S#s.nodes, {rpc_call, self(), Msg}),
+  Parent ! {rpc_result, self(), Loop(S)}.
 
 
 %%%_ * Heartbeat -------------------------------------------------------
@@ -92,8 +94,6 @@ replicate(Entries, S) ->
   ok.
 
 %% one more case: catchup: -> send new append with more entries
-
-
 
 %%%_ * Respond ---------------------------------------------------------
 -spec respond(pid(), rpc(), #s{}) -> return().
