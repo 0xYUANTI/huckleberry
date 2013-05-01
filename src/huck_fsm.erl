@@ -1,6 +1,8 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% @doc A single Raft replica.
 %%%
+%%% differences: no retry; timer reset on vote ack fail
+%%%
 %%% @todo commit
 %%% @todo catchup
 %%% @todo reconfiguration
@@ -78,61 +80,12 @@
 -define(FSM, ?MODULE).
 
 %%%_* Code =============================================================
-%%%_ * Types -----------------------------------------------------------
-%%%_  * Server state ---------------------------------------------------
--record(s,
-        { %% Cluster members
-          nodes=error('s.nodes') :: [node()]
-          %% Clock
-        , term=error('s.term') :: non_neg_integer()
-          %% Last known leader
-        , leader=error('s.leader') :: node()
-          %% Voted for in current election
-        , candidate=error('s.candidate') :: node()
-          %% Log state
-        , log_vsn=error('s.log_vsn') :: vsn()
-          %% huck_log handle
-        , log=error('s.log') :: _
-          %% Statemachine state
-        , committed=error('s.committed') :: non_neg_integer()
-          %% Current timeout
-        , timer=error('s.timer') :: reference()
-          %% In-flight RPCs
-        , reqs=dict:new() :: dict(id(), [#ack{}])
-          %% Clients
-        , froms=dict:new() :: dict(id(), {_, _})
-        }).
-
-%%%_  * Messages -------------------------------------------------------
--record(vote,
-        { id=?uuid()                          :: uuid()
-        , term=error('vote.term')             :: non_neg_integer()
-        , leader=node()                       :: node()
-        , log_vsn=error('vote.log_vsn')       :: vsn().
-        }).
-
--record(append,
-        { id=?uuid()                          :: uuid()
-        , term=error('append.term')           :: non_neg_integer()
-        , candidate=node()                    :: node()
-        , log_vsn=error('append.log_vsn')     :: vsn()
-        , entries=[]                          :: [_]
-        , committed=error('append.committed') :: non_neg_integer()
-        }).
-
--record(ack
-        { id=error('ack.id')                  :: uuid()
-        , term=error('ack.term')              :: non_neg_integer()
-        , node=node()                         :: node()
-        , success=error('ack.success')        :: boolean()
-        }).
-
 %%%_ * API -------------------------------------------------------------
 start_link(Args) -> gen_fsm:start_link({local, ?FSM}, ?MODULE, Args, []).
 stop()           -> gen_fsm:sync_send_all_state_event(?FSM, stop).
 
-update(Cmd)      -> gen_fsm:sync_send_event(?FSM, {update, Cmd}, infinity).
-inspect(Cmd)     -> gen_fsm:sync_send_event(?FSM, {inspect, Cmd}, infinity).
+read(Cmd)        -> gen_fsm:sync_send_event(?FSM, {read, Cmd},  infinity).
+write(Cmd)       -> gen_fsm:sync_send_event(?FSM, {write, Cmd}, infinity).
 
 %%%_ * gen_fsm callbacks: misc -----------------------------------------
 init(Args) -> {ok, follower, do_init(Args)}.
@@ -149,110 +102,76 @@ handle_info(Info, State, S) -> ?warning("~p", [Info]), {next_state, State, S}.
 
 %%%_ * gen_fsm callbacks: states ---------------------------------------
 %%%_  * Follower -------------------------------------------------------
-follower(#vote{} = Vote, #s{timer=T} = S0) ->
-  {Ack, S} = vote(Vote, S0),
-  _        = send(Vote#vote.candidate, Ack),
-  {next_state, follower, S#s{timer=reset(T, election)}};
-follower(#append{} = Append, #s{timer=T} = S0) ->
-  {Ack, S} = append(Append, S0),
-  _        = send(Append#append.leader, Ack),
-  {next_state, follower, S#s{timer=reset(T, election)}};
-follower(#ack{}, S) ->
-  {next_state, follower, S}; %ignore
-follower({timeout, T, election}, #s{timer=T} = S) ->
-  {next_state, candidate, do_election(S)}.
-
+follower({rpc_call, Pid, Msg}, #s{} = S0) ->
+  {_, S} = huck_rpc:respond(Pid, Msg, S0),
+  {next_state, follower, reset(S)};
+follower({rpc_return, _Pid, {error, _}}, S) ->
+  {next_state, follower, S};
+follower({timeout, Ref, election}, #s{timer=Ref} = S) ->
+  {next_state, candidate, huck_rpc:election(S)}.
 
 follower(Msg, From, S) ->
   _ = forward(Msg, From, S),
   {next_state, follower, S}.
 
 %%%_  * Candidate ------------------------------------------------------
-candidate(#vote{candidate=C} = Vote, #s{timer=T} = S0) ->
-  {Ack, S} = vote(Vote, S0),
-  _        = send(Vote#vote.candidate, Ack),
-  case {Ack#ack.success, S#s.term > S0#s.term} of
-    {true, _} ->
-      {next_state, follower, S#s{timer=reset(T, election), reqs=dict:new()}};
-    {false, true} ->
-      {next_state, follower, S#s{reqs=dict:new()}};
-    {false, false} ->
+candidate({rpc_call, Pid, Msg}, #s{} = S0) ->
+  case huck_rpc:respond(Pid, Msg, S0) of
+    {ok, S} ->
+      {next_state, follower, reset(S)};
+    {error, S} when S#s.term > S0#s.term ->
+      {next_state, follower, reset(S)};
+    {error, S} when S#s.term =:= S0#s.term ->
       {next_state, candidate, S}
   end;
-candidate(#append{leader=L} = Append, #s{timer=T} = S0) ->
-  {Ack, S} = append(Append, S0),
-  _        = send(Append#append.leader, Ack),
-  case Ack#ack.success of
-    true ->
-      {next_state, follower, S#s{timer=reset(T, election), reqs=dict:new()}};
-    false ->
+candidate({rpc_return, Pid, Ret}, #s{rpc=Pid} = S0) ->
+  case Ret of
+    {ok, S} ->
+      {next_state, leader, huck_rpc:heartbeat(S)};
+    {error, S} when S#s.term > S0#s.term ->
+      {next_state, follower, reset(S)};
+    {error, S} when S#s.term =:= S0#s.term ->
       {next_state, candidate, S}
   end;
-candidate(#ack{} = Ack, #s{} = S0) ->
-  {State, S} = ack(candidate, Ack, S0),
-  case State of
-    leader -> {next_state, State, do_heartbeat(S)};
-    _      -> {next_state, State, S}
-  end;
-candidate({timeout, T, election}, #s{timer=T} = S) ->
-  {next_state, candidate, do_election(S)}.
-
+candidate({rpc_return, _, {error, _}}, #s{} = S) ->
+  {next_state, candidate, S};
+candidate({timeout, Ref, election}, #s{timer=Ref} = S) ->
+  {next_state, candidate, huck_rpc:election(S)}.
 
 candidate(_Msg, _From, S) ->
   {reply, {error, election}, candidate, S}.
 
 %%%_  * Leader ---------------------------------------------------------
-leader(#vote{} = Vote, #s{timer=T} = S0) ->
-  {Ack, S} = vote(Vote, S0),
-  _        = send(Vote#vote.candidate, Ack),
-  case {Ack#ack.success, S#s.term > S0#s.term} of
-    {true, _} ->
-      {next_state, follower, S#s{timer=reset(T, election), reqs=dict:new()}};
-    {false, true} ->
-      {next_state, follower, S#{reqs=dict:new()}};
-    {false, false} ->
-      {next_state, leader, S}
-  end;
-leader(#append{} = Append, #s{timer=T} = S0) ->
-  {Ack, S} = append(Append, S0),
-  _        = send(Append#append.leader, Ack),
-  case Ack#ack.success of
-    true ->
-      {next_state, follower, S#s{timer=reset(T, election), reqs=dict:new()}};
-    false ->
-      {next_state, leader, S}
-  end;
-leader(#ack{id=I} = Ack, #s{froms=F} = S0) ->
-  case ack(leader, Ack, S0) of
+leader({rpc_call, Pid, Msg}, #s{} = S0) ->
+  case huck_rpc:respond(Pid, Msg, S0) of
     {ok, S} ->
-      gen_fsm:reply(dict:fetch(I, F), ok),
-      commit(), %FIXME
+      {next_state, follower, reset(S)};
+    {error, S} when S#s.term > S0#s.term ->
+      {next_state, follower, reset(S)};
+    {error, S} when S#s.term =:= S0#s.term ->
+      {next_state, leader, S}
+  end;
+leader({rpc_return, Pid, Ret} #s{rpc=Pid} = S0) ->
+  case Ret of
+    {ok, S} ->
+      %% ...
       {next_state, leader, S};
-    {{error, _} = Err, S} ->
-      gen_fsm:reply(dict:fetch(I, F), Err),
-      {next_state, leader, S};
-    S ->
+    {error, S} when S#s.term > S0#s.term ->
+      {next_state, follower, reset(S)};
+    {error, S} when S#s.term =:= S0#s.term ->
+      %% ...
       {next_state, leader, S}
   end;
 leader({timeout, T, heartbeat}, #s{timer=T} = S) ->
-  {next_state, candidate, do_heartbeat(S)}.
+  {next_state, leader, huck_rpc:heartbeat(S)}.
 
-
-leader({update, Cmd},
-       From,
-       #s{nodes=N, term=T, log=L, committed=C, reqs=R} = S) ->
-  E  = [Cmd],
-  LV = huck_log:log(L, E)
-  ID = broadcast(N, #append{term=T, log_vsn=LV, committed=C, entries=E}),
-  {next_state, leader, S#{ log_vsn = LV
-                         , reqs    = dict:store(ID, [], R)
-                         , froms   = dict:store(ID, From, F)
-                         }};
-leader({inspect, Cmd}, _From, {log=L} = S) ->
-  {reply, ?lift(huck_log:inspect(L, Cmd)), leader, S}.
+leader({write, Cmd}, From, #s{} = S) ->
+  %% Buffer
+  {next_state, leader, S};
+leader({read, Cmd}, _From, {log=L} = S) ->
+  {reply, ?lift(huck_log:read(L, Cmd)), leader, S}.
 
 %%%_ * Internals -------------------------------------------------------
-%%%_  * Bootstrap ------------------------------------------------------
 do_init(Args) ->
   Root = s2_env:get_arg(Args, ?APP, root)
   #s{ nodes     = s2_env:get_arg(Args, ?APP, nodes)
@@ -263,112 +182,20 @@ do_init(Args) ->
     , timer     = gen_fsm:start_timer(timeout(election), election)
     }.
 
-timeout(election)  -> s2_rand:number(150, 300); %ms
+timeout(election)  -> s2_rand:number(150, 300);
 timeout(heartbeat) -> s2_rand:number(, ).
 
-%%%_  * RPCs -----------------------------------------------------------
-%%%_   * Vote ----------------------------------------------------------
--spec vote(#vote{}, #s{}) -> {#ack{}, #s{}}.
-%% @doc Pure function which implements Raft's election semantics.
-vote(#vote{id=I, term=T1, candidate=C1, log_vsn=LV1},
-     #s{term=T2, candidate=C2, log_vsn=LV2}) ->
-  case
-    ?do(?thunk(T1 >= T2                   orelse throw({error, {term, T2}})),
-        ?thunk(C1 =:= C2 orelse C2 =:= '' orelse throw({error, {candidate, C2}})),
-        ?thunk(LV1 >= LV2                 orelse throw({error, {log_vsn, LV2}})))
-  of
-    {ok, _} ->
-      {#ack{id=I, term=T1, success=true}, S#s{term=max(T1, T2), candidate=C1}};
-    {error, _} ->
-      {#ack{id=I, term=max(T1, T2), success=false}, S#s{term=max(T1, T2)}}
-  end.
+reset(#s{timer=T} = S) -> S#s{timer=do_reset(T, election), rpc=''}.
 
-%%%_   * Append --------------------------------------------------------
--spec append(#append{}, #s{}) -> {#ack{}, #s{}}.
-%% @doc Pure function which implements Raft's replication semantics.
-append(#append{id=I, term=T1, leader=L, log_vsn=LV, entries=E, committed=C},
-       #s{term=T2, log=Log} = S) ->
-  case
-    ?do(?thunk(T1 >= T2 orelse throw({error, {term, T2}})),
-        ?thunk(huck_log:log(Log, LV, E, C)),
-  of
-    {ok, _} ->
-      {#ack{id=I, term=T1, success=true}, S#s{term=T1, leader=L}};
-    {error, _} ->
-      {#ack{id=I, term=max(T1, T2), success=false}, S#s{term=max(T1, T2)}}
-  end.
-
-%%%_   * Ack -----------------------------------------------------------
--spec ack(atom(), #ack{}, #s{}) -> {atom(), #s{}}.
-%% @doc Pure function which implements Raft's request FSM.
-ack(State, #ack{id=I} = Ack, #s{reqs=R0} = S) ->
-  case ?lift(dict:update(I, s2_lists:cons(Ack), R0)) of
-    %% We have an outstanding request with a matching UUID, check for quorum.
-    {ok, R} -> ack(State, I, S#s{reqs=R});
-    %% Ack concerns stale request, ignore.
-    {error, _} -> {State, S}
-  end;
-ack(candidate, ID, #s{} = S) ->
-  ?hence(dict:size(R) =:= 1),
-  case reqstate(ID, S) of
-    success -> {leader,    S#s{reqs=dict:new()}};
-    failure -> {candidate, S#s{reqs=dict:new()}};
-    tie     -> {candidate, S#s{reqs=dict:new()}};
-    pending -> {candidate, S}
-  end;
-ack(leader, ID, #s{reqs=R}) ->
-  case reqstate(ID, S) of
-    success -> {ok,              S#s{reqs=dict:erase(ID, R)}};
-    failure -> {{error, quorum}, S#s{reqs=dict:new(ID, R)}};
-    tie     -> {{error, quorum}, S#s{reqs=dict:new(ID, R)}};
-    pending -> S
-  end.
-
-
-reqstate(ID, #s{nodes=N, reqs=R}) ->
-  Cluster = length(N),
-  Quorum  = Cluster div 2, %self gives majority
-  Acks    = dict:fetch(ID, R),
-  Yays    = length([Ack || #ack{success=true}  <- Acks]),
-  Nays    = length([Ack || #ack{success=false} <- Acks]),
-  case {Yays >= Quorum, Nays >= Quorum, Yays + Nays =:= Cluster - 1} of
-    {true,  false, _}    -> success;
-    {false, true,  _}    -> failure;
-    {false, false, true} -> tie;
-    _                    -> pending
-  end.
-
-%%%_  * Transitions ----------------------------------------------------
-do_election(#s{nodes=N, term=T, log_vsn=L, timer=Ti} = S) ->
-  S#s{ term  = T+1
-     , timer = reset(Ti, election)
-     , reqs  = dict:store(broadcast(C, #vote{term=T+1, log_vsn=L}),
-                          [],
-                          dict:new())
-     }.
-
-do_heartbeat(#s{nodes=N, term=T, log_vsn=L, committed=C, timer=Ti, reqs=R} = S) ->
-  S#s{ timer = reset(Ti, heartbeat)
-     , reqs  = dict:store(broadcast(N, #append{term=T, log_vsn=L, committed=C}),
-                          [],
-                          R)
-     }.
-
-%%%_  * Primitives -----------------------------------------------------
+%% Don't need to flush.
 reset(Ref, Msg) ->
   Remaining = gen_fsm:cancel_timer(Ref),
   ?hence(is_integer(Remaining)),
-  %% Don't need to flush.
   gen_fsm:start_timer(timeout(Msg), Msg).
 
 
-broadcast(Nodes, MSg) ->
-  _ = [spawn(?thunk(send(Node, Msg))) || Node <- Nodes -- [node()]],
-  element(2, Msg).
-
-send(Node, Msg) -> gen_fsm:send_event({?FSM, Node}, Msg, ?SEND_TO).
-
-forward(Msg, From, #s{leader=L}) -> send(L, Msg, From).
+do_election(#s{term=N, timer=Ref} = S) ->
+  huck_rpc:election(S#s{term=N+1, timer=reset_timer(Ref, election)}).
 
 %%%_* Tests ============================================================
 -ifdef(TEST).
