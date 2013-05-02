@@ -42,11 +42,141 @@
 -include("huckleberry.hrl").
 
 %%%_* Code =============================================================
-%%%_ * Election --------------------------------------------------------
+%%%_ * Requests --------------------------------------------------------
+%%%_  * API ------------------------------------------------------------
 -spec election(#s{}) -> #s{}.
-election(S) ->
-  S#s{candidate=node(), rpc=rpc(#vote{term=N, log_vsn=V}, election_loop, S)}.
-  spawn_link(?MODULE, do_election, [self(), S])}.
+%% @doc
+election(#s{term=N, log_vsn=Vsn} = S) ->
+  S#s{candidate=node(), rpc=rpc(#vote{term=N, log_vsn=Vsn},
+                                ?REQUEST_VOTE_TO,
+                                fun nop/3,
+                                S)}.
+
+nop(_Pid, _Rsn, _S) -> ok.
+
+
+-spec heartbeat(#s{}) -> #s{}.
+%% @equiv replicate([], S).
+heartbeat(S) -> replicate([], S).
+
+
+-spec replicate([_], #s{}) -> #s{}.
+replicate(Entries, #s{} = S) ->
+  S#s{rpc=rpc(#append{entries=Entries},
+              ?APPEND_ENTRIES_TO,
+              fun catchup/3,
+              S)}.
+
+catchup(Pid, LogVsn, S) ->
+  ok.
+
+%%%_  * Internals ------------------------------------------------------
+-record(reqstate,
+        { decision=pending
+        , resp=0
+        , succ=0
+        , fail=0
+        , quorum=error('req.quorum')
+        , all=error('req.all')
+        }).
+
+rpc(Msg, Timeout, Handler, S) ->
+  spawn_link(?MODULE, rpc, [Msg, Timeout, Handler, S, self()]).
+rpc(Msg, Timeout, Handler, S, Parent) ->
+  broadcast(S#s.nodes, {rpc_call, self(), Msg}),
+  Parent ! {rpc_result, self(), rpc_loop(Timeout, Handler, S)}.
+
+rpc_loop(Timeout, Handler, S) ->
+  N = length(S#s.nodes),
+  rpc_loop(#reqstate{quorum=N div 2, all=N-1}, Timeout, Handler, S).
+
+rpc_loop(#reqstate{decision=pending} = Req, Timeout, Handler, S) ->
+  receive
+    {rpc_ack, Pid, {expired, Term}} ->
+      {expired, S#s{term=Term}};
+    {rpc_ack, Pid, {failure, Rsn}} ->
+      _ = Handler(Pid, Rsn, S),
+      rpc_loop(fail(Req), Timeout, Handler, S);
+    {rpc_ack, _Pid, success} ->
+      rpc_loop(succ(Req), Timeout, Handler, S)
+  after
+    Timeout -> {failure, S}
+  end;
+rpc_loop(#reqstate{decision=D}, _Timeout, _Hanlder, S) -> {D, S}.
+
+
+fail(#req{fail=F, resp=R} = Req) -> decide(Req#req{fail=F+1, resp=R+1}).
+succ(#req{succ=S, resp=R} = Req) -> decide(Req#req{succ=S+1, resp=R+1}).
+
+decide(#req{succ=S, fail=F, resp=R, quorum=Q, all=A} = Req) ->
+  Req#req{decision=if S =:= Q -> success;
+                      F =:= Q -> failure;
+                      R =:= A -> failure;
+                      true    -> pending
+                   end}.
+
+
+%%
+broadcast(Nodes, Msg) ->
+  _ = [ok = gen_fsm:send_event({?FSM, Node}, Msg) || Node <- Nodes -- [node()]],
+  ok.
+
+forward(Msg, From, #s{leader=L}) -> send(L, Msg, From).
+
+%%%_ * Responses -------------------------------------------------------
+-spec respond(pid(), rpc(), #s{}) -> return().
+%% @doc
+respond(Pid, Msg, S) ->
+  Pid = spawn_link(?MODULE, respond, [Pid, Msg, S, self()]),
+  receive {Pid, Ret} -> Ret end.
+
+respond(Pid,
+        #vote{term=T1, candidate=C1, log_vsn=LV1},
+        #s{term=T2, candidate=C2, log_vsn=LV2},
+        Parent) ->
+  case
+    ?do(?thunk(T1 >= T2                   orelse throw({error, {term, T2}})),
+        ?thunk(C1 =:= C2 orelse C2 =:= '' orelse throw({error, {candidate, C2}})),
+        ?thunk(LV1 >= LV2                 orelse throw({error, {log_vsn, LV2}})))
+  of
+    {ok, _} ->
+      Pid    ! {rpc_ack, self(), success},
+      Parent ! {success, S#s{term=max(T1, T2), candidate=C1}};
+    {error, {term, T}} ->
+      Pid    ! {rpc_ack, self(), {expired, T}},
+      Parent ! {failure, S};
+    {error, Rsn} when T1 > T2 ->
+      Pid    ! {rpc_ack, self(), {failure, Rsn}},
+      Parent ! {expired, S#s{term=T1}};
+    {error, Rsn} ->
+      Pid    ! {rpc_ack, self(), {failure, Rsn}},
+      Parent ! {failure, S}
+  end;
+do_respond(Pid,
+           #append{term=T1, leader=L, log_vsn=LV, committed=C, entries=E},
+           #s{term=T2, log=Log} = S,
+           Parent) ->
+  case
+    ?do(?thunk(T1 >= T2 orelse throw({error, {term, T2}})),
+        ?thunk(huck_log:log(Log, E, LV, C))),
+  of
+    {ok, _} ->
+      Pid    ! {rpc_ack, self(), success},
+      Parent ! {success, S#s{term=T1, leader=L}};
+    {error, {term, T}} ->
+      Pid ! {rpc_ack, self(), {expired, T}},
+      Parent ! {failure, S};
+    {error, {log_vsn, LV} = Rsn} ->
+      Pid ! {rpc_ack, self(), {failure, Rsn}},
+      catchup(Pid, S)
+  end.
+
+catchup(Pid, S) ->
+    %% {expired, S#s{term=T}}
+    Parent ! {failure, S}.
+
+
+%%%_ * FIXME -----------------------------------------------------------
 
 election_loop(Acc0, Term, ClusterSize) ->
   receive
@@ -59,13 +189,19 @@ election_loop(Acc0, Term, ClusterSize) ->
     10 -> failure
   end.
 
-result(Acks, Term, ClusterSize) ->
+
+
+
+
+
+reqstate(Acks, Term, ClusterSize) ->
   MaxTerm = lists:max([Ack#ack.term || Ack <- Acks]),
-  Quorum  = ClusterSize div 2, %self gives majority
   Yays    = length([Ack || #ack{success=true}  <- Acks]),
   Nays    = length([Ack || #ack{success=false} <- Acks]),
+  Quorum  = ClusterSize div 2, %self gives majority
+  Other   = ClusterSize - 1,
   case
-    {MaxTerm > Term, Yays >= Quorum, Nays >= Quorum, Yays + Nays =:= Cluster-1}
+    {MaxTerm > Term, Yays >= Quorum, Nays >= Quorum, Yays + Nays =:= Other}
   of
     {true,  false, _,     _}     -> expired;
     {false, true,  false, _}     -> success;
@@ -75,63 +211,31 @@ result(Acks, Term, ClusterSize) ->
   end.
 
 
+replicate_loop(#req{} = Req, #s{} = S) ->
+  receive
+    {rpc_ack, Pid, {expired, Term}} ->
+      {expired, Term};
+    {rpc_ack, Pid, {failure, LogVsn}} ->
+      catchup(Pid),
+      replicate_loop();
+    {rpc_ack, _Pid, success} ->
+      replicate_loop()
+  after
+    10 -> failure
+  end
 
-rpc(Msg, Loop, S) ->
-  spawn_link(?MODULE, rpc, [Msg, Loop, S, self()]).
-rpc(Msg, Loop, S, Parent) ->
-  broadcast(S#s.nodes, {rpc_call, self(), Msg}),
-  Parent ! {rpc_result, self(), Loop(S)}.
 
 
-%%%_ * Heartbeat -------------------------------------------------------
--spec heartbeat(#s{}) -> #s{}.
-heartbeat(S) -> replicate([], S).
-
-
-%%%_ * Replicate -------------------------------------------------------
--spec replicate([_], #s{}) -> #s{}.
-replicate(Entries, S) ->
-  ok.
-
-%% one more case: catchup: -> send new append with more entries
-
-%%%_ * Respond ---------------------------------------------------------
--spec respond(pid(), rpc(), #s{}) -> return().
-respond(Pid, Msg, S) ->
-  Pid = spawn_link(?MODULE, do_respond, [Pid, Msg, S]),
-  receive {Pid, Ret} -> Ret end.
-
-do_respond(Pid,
-           #vote{term=T1, candidate=C1, log_vsn=LV1},
-           #s{term=T2, candidate=C2, log_vsn=LV2}) ->
-  case
-    ?do(?thunk(T1 >= T2                   orelse throw({error, {term, T2}})),
-        ?thunk(C1 =:= C2 orelse C2 =:= '' orelse throw({error, {candidate, C2}})),
-        ?thunk(LV1 >= LV2                 orelse throw({error, {log_vsn, LV2}})))
-  of
-    {ok, _} ->
-      Pid ! #ack{term=T1, success=true},
-      {ok, S#s{term=max(T1, T2), candidate=C1}};
-    {error, _} ->
-      Pid ! #ack{term=max(T1, T2), success=false},
-      {error, S#s{term=max(T1, T2)}}
-  end;
-do_respond(Pid,
-           #append{term=T1, leader=L, log_vsn=LV, committed=C, entries=E},
-           #s{term=T2, log=Log} = S) ->
-  case
-    ?do(?thunk(T1 >= T2 orelse throw({error, {term, T2}})),
-        ?thunk(huck_log:log(Log, E, LV, C))),
-  of
-    {ok, _} ->
-      Pid ! #ack{term=T1, success=true},
-      {ok, S#s{term=T1, leader=L}};
-    {error, _} ->
-      Pid ! #ack{term=max(T1, T2), success=false}
-      {error, S#s{term=max(T1, T2)}}
+election_loop(Acc0, Term, ClusterSize) ->
+  receive
+    #ack{} = A ->
+      case result([A|Acc0] = Acc, Term, ClusterSize) of
+        pending -> election_loop(Acc, Term, ClusterSize);
+        Ret     -> Ret
+      end
+  after
+    10 -> failure
   end.
-
-
 
 
 -spec ack(atom(), #ack{}, #s{}) -> {atom(), #s{}}.
@@ -194,14 +298,8 @@ leader({inspect, Cmd}, _From, {log=L} = S) ->
   {reply, ?lift(huck_log:inspect(L, Cmd)), leader, S}.
 
 
-%%%_ * Primitives ------------------------------------------------------
-broadcast(Nodes, Msg) ->
-  _ = [ok = send(Node, Msg) || Node <- Nodes -- [node()]],
-  ok.
 
-send(Node, Msg) -> gen_fsm:send_event({?FSM, Node}, Msg, ?SEND_TO).
 
-forward(Msg, From, #s{leader=L}) -> send(L, Msg, From).
 
 %%%_* Tests ============================================================
 -ifdef(TEST).
