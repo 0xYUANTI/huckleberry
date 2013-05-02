@@ -53,11 +53,16 @@
 
 %% Messages sent between huck_rpc and huck_fsm.
 -type msg()    :: {rpc_call,   pid(), #vote{} | #append{}}
-                | {rpc_return, pid(), return()}.
+                | {rpc_return, pid(), return()}
+                | {rpc_ack,    pid(), ack()}.
 
 -type return() :: {success, #s{}}
                 | {failure, #s{}}
                 | {expired, #s{}}.
+
+-type return() :: success
+                | {failure, Rsn::_}
+                | {expired, Term::non_neg_integer()}.
 
 %%%_* Footer ===========================================================
 -endif. %include guard
