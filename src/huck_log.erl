@@ -19,7 +19,7 @@
 	]).
 
 %% Statemachine API
--export([ inspect/2
+-export([
         ]).
 
 %% gen_server callbacks
@@ -35,10 +35,75 @@
 -include("huckleberry.hrl").
 
 %%%_* Code =============================================================
-%%%_ * Types -----------------------------------------------------------
--type index() :: non_neg_integer().
+log(Log, CurrentVsn, Entries, Committed) ->
+  truncate(Vsn),
+  append(Commands),
+  commit(Committed).
 
-%%%_ * API -------------------------------------------------------------
+
+
+
+truncate() ->
+  ok.
+
+append() ->
+  ok.
+
+commit() ->
+  ok.
+
+catchup() ->
+  ok.
+
+foo(Log, Index, Term, Entries) ->
+  #entry{idx=I, term=T} = latest(Log),
+  case {I, T} of
+    {Index, Term} ->
+      append(Log, Entries);
+    {I, Term} ->
+      catchup(I);
+    {_, T} when T < Term ->
+      %% ask for prev term
+      %% lookup newest index from that term
+      %% then catchup from there
+
+      %% messages should contain all prev terms
+      %% may need to send snapsho
+    {_, T} when T > Term ->
+      %% look for largest indx from Term
+      %% might need to inspec terms < Term ?
+  end.
+
+
+%% -> logterms
+%% <- lowest ok term, indexes
+%% -> {term, index}
+%% <- entries
+
+%% possible:?
+%% -> logterms w/maxidx each
+%% <- entries
+
+
+%% cleaner:
+%% -> committed
+%% <- entries (and possibly snapshot)
+
+
+latest() ->
+  dlog:peek().
+logdata() ->
+  dlog:foldterms()
+committed() ->
+  %% from local file
+
+
+
+
+
+
+
+
 %% Leaders.
 -spec log(log(), entries()) -> vsn().
 log(Log, Entries) ->
