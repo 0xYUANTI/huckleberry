@@ -5,6 +5,16 @@
 %%% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
+
+member
+length
+concat
+
+term
+last_term
+
+
+
 %%%_* Module declaration ===============================================
 -module(huck_log).
 -behaviour(gen_server).
